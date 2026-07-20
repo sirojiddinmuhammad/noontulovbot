@@ -52,6 +52,12 @@ TASHKENT_TZ = timezone(timedelta(hours=5))
 NOTION_API = "https://api.notion.com/v1/pages"
 NOTION_VERSION = "2022-06-28"
 
+# "Berilmadi" larni ro'yxatlash uchun database ID (data source emas).
+# Kerak bo'lsa Railway'da NOTION_DATABASE_ID orqali o'zgartiring.
+NOTION_DATABASE_ID = os.environ.get(
+    "NOTION_DATABASE_ID", "f000feae-4072-46df-b120-3f98ec527b21"
+)
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -116,12 +122,77 @@ def add_to_notion(nomer: str, summa: int, tolov_vaqti: str, xabar_vaqti: str, sa
             "Tolov vaqti": {"rich_text": [{"text": {"content": tolov_vaqti}}]},
             "Xabar vaqti": {"rich_text": [{"text": {"content": xabar_vaqti}}]},
             "Sana": {"date": {"start": sana}},
-            "Status": {"status": {"name": "Not started"}},
+            "Status": {"status": {"name": "Berilmadi"}},
         },
     }
     resp = requests.post(NOTION_API, headers=headers, json=payload, timeout=30)
     resp.raise_for_status()
     return resp.json()
+
+
+def get_berilmadi_list():
+    """
+    Barcha "Berilmadi" statusli yozuvlarni Notiondan o'qiydi.
+    (№, summa) juftliklari ro'yxatini qaytaradi, № bo'yicha o'sish tartibida.
+    """
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
+    body = {
+        "filter": {"property": "Status", "status": {"equals": "Berilmadi"}},
+        "page_size": 100,
+    }
+
+    items = []
+    start_cursor = None
+    while True:
+        if start_cursor:
+            body["start_cursor"] = start_cursor
+        resp = requests.post(url, headers=headers, json=body, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        for row in data.get("results", []):
+            props = row.get("properties", {})
+            # Name (title)
+            title_arr = props.get("Name", {}).get("title", [])
+            nomer = title_arr[0]["plain_text"] if title_arr else "?"
+            # Summa (number)
+            summa = props.get("Summa", {}).get("number")
+            summa = summa if summa is not None else 0
+            items.append((nomer, summa))
+
+        if data.get("has_more"):
+            start_cursor = data.get("next_cursor")
+        else:
+            break
+
+    # № bo'yicha raqamli tartiblash (raqam bo'lmasa oxiriga)
+    def sort_key(item):
+        try:
+            return (0, int(item[0]))
+        except ValueError:
+            return (1, 0)
+
+    items.sort(key=sort_key)
+    return items
+
+
+def format_berilmadi(items):
+    """Berilmadi ro'yxatini Telegram uchun matn qilib formatlaydi."""
+    if not items:
+        return "📋 Berilmaganlar yo'q."
+    lines = ["📋 Berilmaganlar:"]
+    total = 0
+    for nomer, summa in items:
+        lines.append(f"№ {nomer} — {summa}")
+        total += summa
+    lines.append("")
+    lines.append(f"JAMI: {total}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -187,14 +258,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     logger.info("Qo'shildi: № %s, summa %s", nomer, summa)
+
+    # Berilmadi ro'yxatini o'qib, tasdiqqa qo'shamiz
+    try:
+        berilmadi = get_berilmadi_list()
+        royxat = format_berilmadi(berilmadi)
+    except Exception:
+        logger.exception("Berilmadi ro'yxatini o'qishda xato")
+        royxat = "(ro'yxatni o'qib bo'lmadi)"
+
     await reply_or_notify(
         context,
         msg,
-        f"✅ Qo'shildi\n"
-        f"№ {nomer}\n"
-        f"Sana: {now.strftime('%d/%m/%y')}\n"
-        f"Summa: {summa}\n"
-        f"To'lov: {tolov_vaqti} | Xabar: {xabar_vaqti}",
+        f"✅ № {nomer} qo'shildi\n\n{royxat}",
     )
 
 
