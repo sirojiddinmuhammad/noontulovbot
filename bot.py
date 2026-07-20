@@ -108,14 +108,14 @@ def parse_message(text: str):
 # ---------------------------------------------------------------------------
 # Notionga yozish
 # ---------------------------------------------------------------------------
-def add_to_notion(nomer: str, summa: int, tolov_vaqti: str, xabar_vaqti: str, sana: str):
+def add_to_notion(nomer, summa, tolov_vaqti, xabar_vaqti, sana, tg_id=""):
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
         "Notion-Version": NOTION_VERSION,
         "Content-Type": "application/json",
     }
     payload = {
-        "parent": {"type": "data_source_id", "data_source_id": NOTION_DATA_SOURCE_ID},
+        "parent": {"type": "database_id", "database_id": NOTION_DATABASE_ID},
         "properties": {
             "Name": {"title": [{"text": {"content": nomer}}]},
             "Summa": {"number": summa},
@@ -123,10 +123,62 @@ def add_to_notion(nomer: str, summa: int, tolov_vaqti: str, xabar_vaqti: str, sa
             "Xabar vaqti": {"rich_text": [{"text": {"content": xabar_vaqti}}]},
             "Sana": {"date": {"start": sana}},
             "Status": {"status": {"name": "Berilmadi"}},
+            "TG_ID": {"rich_text": [{"text": {"content": str(tg_id)}}]},
         },
     }
     resp = requests.post(NOTION_API, headers=headers, json=payload, timeout=30)
+    if resp.status_code >= 400:
+        # Notion javobidagi aniq sababни chiqaramiz
+        try:
+            detail = resp.json().get("message", resp.text)
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f"{resp.status_code}: {detail}")
+    return resp.json()
+
+
+def find_page_by_tgid(tg_id):
+    """
+    Telegram message_id (TG_ID) bo'yicha Notiondagi yozuvni topadi.
+    Topilsa page_id qaytaradi, topilmasa None.
+    """
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
+    body = {
+        "filter": {"property": "TG_ID", "rich_text": {"equals": str(tg_id)}},
+        "page_size": 1,
+    }
+    resp = requests.post(url, headers=headers, json=body, timeout=30)
     resp.raise_for_status()
+    results = resp.json().get("results", [])
+    return results[0]["id"] if results else None
+
+
+def write_edited(page_id, edited_text):
+    """Yozuvning "Edited" ustuniga tahrirlangan to'liq matnni yozadi.
+    Summa, vaqt, nomerga tegmaydi."""
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+    url = f"https://api.notion.com/v1/pages/{page_id}"
+    payload = {
+        "properties": {
+            "Edited": {"rich_text": [{"text": {"content": edited_text[:2000]}}]},
+        }
+    }
+    resp = requests.patch(url, headers=headers, json=payload, timeout=30)
+    if resp.status_code >= 400:
+        try:
+            detail = resp.json().get("message", resp.text)
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f"{resp.status_code}: {detail}")
     return resp.json()
 
 
@@ -222,8 +274,15 @@ async def reply_or_notify(context, msg, text):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Kanal posti channel_post sifatida keladi, oddiy chat message sifatida
-    msg = update.message or update.channel_post
+    # Yangi post: message yoki channel_post
+    # Tahrirlangan post: edited_message yoki edited_channel_post
+    is_edit = bool(update.edited_message or update.edited_channel_post)
+    msg = (
+        update.message
+        or update.channel_post
+        or update.edited_message
+        or update.edited_channel_post
+    )
     if msg is None:
         return
 
@@ -239,11 +298,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     parsed, error = parse_message(text)
     if error:
-        # Kanaldagi postga izoh (reply) qilib xatoni ko'rsatadi
         await reply_or_notify(context, msg, f"⚠️ № aniqlanmadi.\n{error}")
         return
 
     summa, tolov_vaqti, nomer = parsed
+    tg_id = msg.message_id  # o'zgarmas Telegram post ID'si
 
     # Sana va xabar vaqti — Toshkent vaqti bo'yicha
     now = datetime.now(TASHKENT_TZ)
@@ -251,13 +310,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     xabar_vaqti = now.strftime("%H:%M")
 
     try:
-        add_to_notion(nomer, summa, tolov_vaqti, xabar_vaqti, sana)
+        if is_edit:
+            # Tahrir: TG_ID bo'yicha o'sha aniq yozuvni topamiz
+            page_id = find_page_by_tgid(tg_id)
+            if page_id:
+                # Topildi — Summa/vaqt/nomerga TEGMAYMIZ,
+                # faqat "Edited" ustuniga to'liq matnni yozamiz
+                write_edited(page_id, text)
+                await reply_or_notify(
+                    context, msg,
+                    f"✏️ № {nomer} tahrirlandi — «Edited» ustuniga yozildi "
+                    f"(asl ma'lumot o'zgармади)."
+                )
+                return
+            else:
+                # TG_ID topilmadi (masalan bot ishga tushishдан oldingi post).
+                # Yangi yozuv sifatida qo'shamiz.
+                add_to_notion(nomer, summa, tolov_vaqti, xabar_vaqti, sana, tg_id)
+                harakat = f"✅ № {nomer} qo'shildi"
+        else:
+            # Yangi post: qo'shamiz (TG_ID bilan)
+            add_to_notion(nomer, summa, tolov_vaqti, xabar_vaqti, sana, tg_id)
+            harakat = f"✅ № {nomer} qo'shildi"
     except Exception as e:
         logger.exception("Notion xatosi")
         await reply_or_notify(context, msg, f"❌ № {nomer} — Notionga yozilmadi:\n{e}")
         return
 
-    logger.info("Qo'shildi: № %s, summa %s", nomer, summa)
+    logger.info("%s (summa %s)", harakat, summa)
 
     # Berilmadi ro'yxatini o'qib, tasdiqqa qo'shamiz
     try:
@@ -267,11 +347,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Berilmadi ro'yxatini o'qishda xato")
         royxat = "(ro'yxatni o'qib bo'lmadi)"
 
-    await reply_or_notify(
-        context,
-        msg,
-        f"✅ № {nomer} qo'shildi\n\n{royxat}",
-    )
+    await reply_or_notify(context, msg, f"{harakat}\n\n{royxat}")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
