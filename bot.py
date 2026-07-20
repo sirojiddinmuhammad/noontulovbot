@@ -137,10 +137,28 @@ async def notify(context, text):
         logger.exception("Log guruhiga yuborishda xato")
 
 
+async def reply_or_notify(context, msg, text):
+    """
+    Avval xabarning o'ziga izoh (reply) qilib tasdiq beradi.
+    Kanalda bot admin bo'lsa, bu post ostida ko'rinadi.
+    Agar reply imkoni bo'lmasa, log guruhiga yuboradi.
+    """
+    try:
+        await msg.reply_text(text)
+    except Exception:
+        logger.info("Reply ishlamadi, log guruhiga yuborilyapti")
+        await notify(context, text)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Kanal posti channel_post sifatida keladi, oddiy chat message sifatida
     msg = update.message or update.channel_post
-    if msg is None or not msg.text:
+    if msg is None:
+        return
+
+    # Rasm bilan kelgan xabarda matn caption ichida bo'ladi
+    text = msg.text or msg.caption
+    if not text:
         return
 
     # Faqat ruxsat etilgan chatlar (agar belgilangan bo'lsa)
@@ -148,9 +166,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info("Ruxsatsiz chat: %s", msg.chat_id)
         return
 
-    parsed, error = parse_message(msg.text)
+    parsed, error = parse_message(text)
     if error:
-        await notify(context, f"№ aniqlanmadi.\n{error}")
+        # Kanaldagi postga izoh (reply) qilib xatoni ko'rsatadi
+        await reply_or_notify(context, msg, f"⚠️ № aniqlanmadi.\n{error}")
         return
 
     summa, tolov_vaqti, nomer = parsed
@@ -164,12 +183,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_to_notion(nomer, summa, tolov_vaqti, xabar_vaqti, sana)
     except Exception as e:
         logger.exception("Notion xatosi")
-        await notify(context, f"❌ № {nomer} — Notionga yozilmadi:\n{e}")
+        await reply_or_notify(context, msg, f"❌ № {nomer} — Notionga yozilmadi:\n{e}")
         return
 
     logger.info("Qo'shildi: № %s, summa %s", nomer, summa)
-    await notify(
+    await reply_or_notify(
         context,
+        msg,
         f"✅ Qo'shildi\n"
         f"№ {nomer}\n"
         f"Sana: {now.strftime('%d/%m/%y')}\n"
@@ -204,8 +224,14 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("chatid", chatid))
-    # filters.TEXT — ham guruh xabarlari, ham kanal postlarini qamrab oladi
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Matnli xabarlar VA rasm/hujjat bilan kelgan (caption'li) xabarlar.
+    # filters.CAPTION — rasm tagida yozilgan matnni ham qamrab oladi.
+    app.add_handler(
+        MessageHandler(
+            (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
+            handle_message,
+        )
+    )
     logger.info("Bot ishga tushdi...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
